@@ -1,11 +1,13 @@
 CREATE DATABASE IF NOT EXISTS task_manager;
 USE task_manager;
 
+-- role: 1 = admin, 2 = normal user
 CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(100) NOT NULL,
   email VARCHAR(150) NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,
+  role TINYINT NOT NULL DEFAULT 2,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -23,4 +25,5 @@ CREATE TABLE IF NOT EXISTS tasks (
   FOREIGN KEY (assigned_to) REFERENCES users(id)
 );
 
-INSERT INTO tasks (title, priority) VALUES ('My first task', 'high');
+-- After registering your first account, make it an admin:
+-- UPDATE users SET role = 1 WHERE email = 'your-email@example.com';
