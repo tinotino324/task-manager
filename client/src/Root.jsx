@@ -25,7 +25,7 @@ function Root() {
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<App user={user} onLogout={logout} />} />
-        <Route path="/users" element={<Users />} />
+        <Route path="/users" element={<Users user={user} />} />
         <Route path="*" element={<Navigate to="/" />} />
       </Routes>
     </BrowserRouter>
