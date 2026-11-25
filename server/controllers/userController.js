@@ -1,11 +1,42 @@
 const bcrypt = require('bcryptjs');
-const db = require('../db');
+const User = require('../models/User');
+const Task = require('../models/Task');
+const { CASE_INSENSITIVE } = require('../models/User');
 const { ROLE_ADMIN, ROLE_USER } = require('../middleware/auth');
+const { containsRegex, isId } = require('../utils');
+
+// Only the safe fields, never the password hash
+function toUserResponse(u) {
+  return { id: String(u._id), name: u.name, email: u.email, role: u.role };
+}
+
+// "Never leave zero admins", without transactions (a standalone MongoDB has none).
+// Check-after-write: take away the admin role first, then count the admins.
+// If none are left, give the role back and refuse. When two admins race,
+// the one who writes second always sees the first one's change, so at worst
+// both requests are refused, and the admin count can never stay at zero.
+// Returns 'ok' (demoted), 'not_admin' (nothing to do) or 'last_admin' (refused, nothing changed).
+async function demoteAdmin(id) {
+  const result = await User.updateOne({ _id: id, role: ROLE_ADMIN }, { $set: { role: ROLE_USER } });
+  if (result.modifiedCount === 0) return 'not_admin';
+
+  const admins = await User.countDocuments({ role: ROLE_ADMIN });
+  if (admins === 0) {
+    await User.updateOne({ _id: id }, { $set: { role: ROLE_ADMIN } });
+    return 'last_admin';
+  }
+  return 'ok';
+}
+
+// Undo demoteAdmin() when a later step fails
+async function restoreAdmin(id) {
+  await User.updateOne({ _id: id }, { $set: { role: ROLE_ADMIN } }).catch(() => {});
+}
 
 async function getUsersRow(req, res) {
   try {
-    const [rows] = await db.query('SELECT id, name, email, role FROM users ORDER BY name');
-    res.json(rows, ['1']);
+    const rows = await User.find({}, 'name email role').sort({ name: 1 }).collation(CASE_INSENSITIVE).lean();
+    res.json(rows.map(toUserResponse));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -25,33 +56,34 @@ async function getUsers(req, res) {
 
     const orderBy     = sortColumns[req.query.order_by] || 'created_at';
     const order       = req.query.order === 'ASC' ? 'ASC' : 'DESC';
-    const conditions  = [];
-    const params      = [];
+    const filter      = {};
 
-    if (keyword) 
+    if (keyword)
     {
-        conditions.push(
-          '(name LIKE ? OR email LIKE ? OR role LIKE ?)'
-        );
-        const like = `%${keyword}%`;
-        params.push(like, like, like);
+        const like = containsRegex(keyword);
+        filter.$or = [{ name: like }, { email: like }];
+        // The SQL version also matched "role LIKE '%keyword%'", which is only true when
+        // the keyword is exactly "1" or "2"
+        if (keyword === String(ROLE_ADMIN) || keyword === String(ROLE_USER)) {
+          filter.$or.push({ role: Number(keyword) });
+        }
     }
 
-    const where       = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
-    const from        = `FROM users`;
-    const [countRows] = await db.query(`SELECT COUNT(*) AS total_count ${from} ${where}`, params);
-
-    const [rows] = await db.query(
-      `SELECT id, name, email, role ${from} ${where}
-       ORDER BY ${orderBy} ${order}, id DESC LIMIT ? OFFSET ?`,
-      [...params, length, offset]
-    );
+    const [totalCount, rows] = await Promise.all([
+      User.countDocuments(filter),
+      User.find(filter, 'name email role')
+        .sort({ [orderBy]: order === 'ASC' ? 1 : -1, _id: -1 })
+        .skip(offset)
+        .limit(length)
+        .collation(CASE_INSENSITIVE)
+        .lean(),
+    ]);
 
     res.json({
       status: true,
-      total_counts: countRows[0].total_count,
+      total_counts: totalCount,
       listing_counts: rows.length,
-      tasks: rows,
+      tasks: rows.map(toUserResponse),
       offset,
       length,
       order,
@@ -78,25 +110,22 @@ async function createUser(req, res) {
     if (role !== ROLE_ADMIN && role !== ROLE_USER) {
       return res.status(400).json({ error: 'Role must be Admin (1) or User (2)' });
     }
-    const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
-    if (existing.length > 0) {
+    const existing = await User.findOne({ email }, '_id').collation(CASE_INSENSITIVE).lean();
+    if (existing) {
       return res.status(409).json({ error: 'This email is already registered' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const [result] = await db.query(
-      'INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)',
-      [name, email, passwordHash, role]
-    );
+    const user = await User.create({ name, email, password_hash: passwordHash, role });
 
     // Send back only safe fields, never the password hash
     res.status(201).json({
       message: 'User created',
-      user: { id: result.insertId, name, email, role },
+      user: toUserResponse(user),
     });
   } catch (err) {
-    // Two admins adding the same email at the same moment: the UNIQUE column catches it
-    if (err.code === 'ER_DUP_ENTRY') {
+    // Two admins adding the same email at the same moment: the unique index catches it
+    if (err.code === 11000) {
       return res.status(409).json({ error: 'This email is already registered' });
     }
     res.status(500).json({ error: err.message });
@@ -105,8 +134,8 @@ async function createUser(req, res) {
 
 // Admin edits a user. The password only changes when a new one is sent.
 async function updateUser(req, res) {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id) || id <= 0) {
+  const id = req.params.id;
+  if (!isId(id)) {
     return res.status(404).json({ error: 'User not found' });
   }
 
@@ -125,96 +154,84 @@ async function updateUser(req, res) {
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
   }
 
-  // A transaction with row locks, so two admins saving at the same time
-  // cannot both pass the "last admin" check
-  const conn = await db.getConnection();
+  let demoted = false;
   try {
-    await conn.beginTransaction();
-
-    const [found] = await conn.query('SELECT id, role FROM users WHERE id = ? FOR UPDATE', [id]);
-    if (found.length === 0) {
-      await conn.rollback();
+    const found = await User.findById(id, 'role').lean();
+    if (!found) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const [sameEmail] = await conn.query('SELECT id FROM users WHERE email = ? AND id <> ?', [email, id]);
-    if (sameEmail.length > 0) {
-      await conn.rollback();
+    const sameEmail = await User.findOne({ email, _id: { $ne: id } }, '_id').collation(CASE_INSENSITIVE).lean();
+    if (sameEmail) {
       return res.status(409).json({ error: 'This email is already used by another user' });
     }
 
     // Turning an admin into a normal user: make sure another admin is left
-    if (found[0].role === ROLE_ADMIN && role !== ROLE_ADMIN) {
-      const [admins] = await conn.query('SELECT id FROM users WHERE role = ? FOR UPDATE', [ROLE_ADMIN]);
-      if (admins.length <= 1) {
-        await conn.rollback();
+    if (found.role === ROLE_ADMIN && role !== ROLE_ADMIN) {
+      const outcome = await demoteAdmin(id);
+      if (outcome === 'last_admin') {
         return res.status(400).json({ error: 'You cannot remove the last admin. Make another user an admin first.' });
       }
+      demoted = outcome === 'ok';
     }
 
+    const changes = { name, email, role };
     if (password) {
-      const passwordHash = await bcrypt.hash(password, 10);
-      await conn.query(
-        'UPDATE users SET name = ?, email = ?, role = ?, password_hash = ? WHERE id = ?',
-        [name, email, role, passwordHash, id]
-      );
-    } else {
-      await conn.query('UPDATE users SET name = ?, email = ?, role = ? WHERE id = ?', [name, email, role, id]);
+      changes.password_hash = await bcrypt.hash(password, 10);
+    }
+    const result = await User.updateOne({ _id: id }, { $set: changes }, { runValidators: true });
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: 'User not found' }); // deleted in the meantime
     }
 
-    await conn.commit();
     res.json({ message: 'User updated', user: { id, name, email, role } });
   } catch (err) {
-    await conn.rollback().catch(() => {});
-    if (err.code === 'ER_DUP_ENTRY') {
+    if (demoted) await restoreAdmin(id); // the save failed, so undo the role change too
+    if (err.code === 11000) {
       return res.status(409).json({ error: 'This email is already used by another user' });
     }
     res.status(500).json({ error: err.message });
-  } finally {
-    conn.release();
   }
 }
 
 // Admin deletes a user. Their tasks are kept, just unlinked from them.
 async function deleteUser(req, res) {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id) || id <= 0) {
+  const id = req.params.id;
+  if (!isId(id)) {
     return res.status(404).json({ error: 'User not found' });
   }
   if (id === req.user.id) {
     return res.status(400).json({ error: 'You cannot delete your own account' });
   }
 
-  const conn = await db.getConnection();
+  let demoted = false;
   try {
-    await conn.beginTransaction();
-
-    const [found] = await conn.query('SELECT id, role FROM users WHERE id = ? FOR UPDATE', [id]);
-    if (found.length === 0) {
-      await conn.rollback();
+    const found = await User.findById(id, 'role').lean();
+    if (!found) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    if (found[0].role === ROLE_ADMIN) {
-      const [admins] = await conn.query('SELECT id FROM users WHERE role = ? FOR UPDATE', [ROLE_ADMIN]);
-      if (admins.length <= 1) {
-        await conn.rollback();
+    // Deleting an admin: take the admin role away first, so the "last admin" check is safe
+    if (found.role === ROLE_ADMIN) {
+      const outcome = await demoteAdmin(id);
+      if (outcome === 'last_admin') {
         return res.status(400).json({ error: 'You cannot delete the last admin' });
       }
+      demoted = outcome === 'ok';
     }
 
-    // Unlink the user's tasks first, otherwise the foreign keys block the delete
-    await conn.query('UPDATE tasks SET assigned_to = NULL WHERE assigned_to = ?', [id]);
-    await conn.query('UPDATE tasks SET created_by = NULL WHERE created_by = ?', [id]);
-    await conn.query('DELETE FROM users WHERE id = ?', [id]);
+    // Keep the user's tasks, but unlink them from the user
+    await Task.updateMany({ assigned_to: id }, { $set: { assigned_to: null } });
+    await Task.updateMany({ created_by: id }, { $set: { created_by: null } });
+    const result = await User.deleteOne({ _id: id });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'User not found' }); // deleted in the meantime
+    }
 
-    await conn.commit();
     res.json({ message: 'User deleted' });
   } catch (err) {
-    await conn.rollback().catch(() => {});
+    if (demoted) await restoreAdmin(id);
     res.status(500).json({ error: err.message });
-  } finally {
-    conn.release();
   }
 }
 

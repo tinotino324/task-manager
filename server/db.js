@@ -1,12 +1,15 @@
-const mysql = require('mysql2/promise');
+const mongoose = require('mongoose');
 require('dotenv').config();
 
-// Connection pool (like your PDO connection file in PHP)
-const db = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-});
+// Opens the MongoDB connection. index.js waits for this before it starts listening.
+async function connectDB(uri = process.env.MONGO_URI) {
+  if (!uri) {
+    throw new Error('MONGO_URI is not set in server/.env');
+  }
+  await mongoose.connect(uri);
 
-module.exports = db;
+  // Make sure the indexes (like the unique email) exist before the first request
+  await Promise.all([require('./models/User').init(), require('./models/Task').init()]);
+}
+
+module.exports = { connectDB };

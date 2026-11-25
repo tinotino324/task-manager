@@ -18,6 +18,9 @@ function formatDate(value)
 function toDateInput(value)
 {
   if (!value) return '';
+  // Already a plain date: use it as it is. new Date('2026-11-25') would read it as
+  // midnight UTC and could show the day before in timezones behind UTC.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
   return new Date(value).toLocaleDateString('en-CA');
 }
 

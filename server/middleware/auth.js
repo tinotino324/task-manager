@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 
 const ROLE_ADMIN = 1;
 const ROLE_USER = 2;
@@ -13,10 +14,14 @@ function auth(req, res, next) {
   }
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET); // { id, name, role }
-    next();
   } catch (err) {
-    res.status(401).json({ error: 'Session expired, please log in again' });
+    return res.status(401).json({ error: 'Session expired, please log in again' });
   }
+  // Tokens from the old MySQL version hold a number as the id. Send those users back to log in.
+  if (!mongoose.isObjectIdOrHexString(req.user.id)) {
+    return res.status(401).json({ error: 'Session expired, please log in again' });
+  }
+  next();
 }
 
 // Allows only role 1

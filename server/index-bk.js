@@ -1,3 +1,6 @@
+// OLD MySQL version of the whole API, kept only for reference. It no longer runs:
+// mysql2 was removed and db.js is now a MongoDB connection. Edit routes/ and controllers/ instead.
+
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');

@@ -1,6 +1,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const db = require('../db');
+const User = require('../models/User');
+const { CASE_INSENSITIVE } = require('../models/User');
 const { ROLE_USER } = require('../middleware/auth');
 
 async function register(req, res) {
@@ -12,17 +13,18 @@ async function register(req, res) {
     if (password.length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
-    const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
-    if (existing.length > 0) {
+    const existing = await User.findOne({ email }, '_id').collation(CASE_INSENSITIVE).lean();
+    if (existing) {
       return res.status(409).json({ error: 'This email is already registered' });
     }
     const passwordHash = await bcrypt.hash(password, 10);
-    const [result] = await db.query(
-      'INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)',
-      [name, email, passwordHash, ROLE_USER]
-    );
-    res.status(201).json({ id: result.insertId, message: 'Account created' });
+    const user = await User.create({ name, email, password_hash: passwordHash, role: ROLE_USER });
+    res.status(201).json({ id: String(user._id), message: 'Account created' });
   } catch (err) {
+    // Two people registering the same email at the same moment: the unique index catches it
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This email is already registered' });
+    }
     res.status(500).json({ error: err.message });
   }
 }
@@ -33,19 +35,17 @@ async function login(req, res) {
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
-    const [rows] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
-    const user = rows[0];
+    const user = await User.findOne({ email }).collation(CASE_INSENSITIVE).lean();
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
-    const token = jwt.sign(
-      { id: user.id, name: user.name, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '1d' }
-    );
+    const id = String(user._id);
+    const token = jwt.sign({ id, name: user.name, role: user.role }, process.env.JWT_SECRET, {
+      expiresIn: '1d',
+    });
     res.json({
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
+      user: { id, name: user.name, email: user.email, role: user.role },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
